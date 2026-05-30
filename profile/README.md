@@ -2,7 +2,7 @@
 
 **Smart contracts that talk to the internet.**
 
-ExternEVM is a custom blockchain runtime — built on a modified [Reth](https://github.com/paradigmxyz/reth) execution client — where Solidity contracts can call any external API during execution. No oracles. No off-chain relayers. No token subscriptions. Just a native precompile baked into the EVM that makes HTTP requests, parses JSON, and returns data directly to your contract.
+ExternEVM is a custom blockchain protocol — execution layer built on a modified [Reth](https://github.com/paradigmxyz/reth), consensus layer built from scratch over the [Ethereum Engine API](https://github.com/ethereum/execution-apis/blob/main/src/engine/paris.md) — where Solidity contracts can call any external API during execution. No oracles. No off-chain relayers. No token subscriptions. Just a native precompile baked into the EVM that makes HTTP requests, parses JSON, and returns data directly to your contract.
 
 ```solidity
 function getBitcoinPrice() external view returns (uint256) {
@@ -37,7 +37,7 @@ A custom precompile lives at address `0x00000000000000000000000000000000000000AA
 7. ABI-encodes the result
 8. Returns it to the contract
 
-From the contract's perspective — it's a `staticcall`. From the node's perspective — it's an HTTP round-trip happening inside block execution.
+In a multi-node deployment, each validator fetches independently, broadcasts via a custom devp2p subprotocol (`extern/1`), and the precompile returns the **median** of all submissions — tolerating minority Byzantine behavior at the protocol level.
 
 ```
 Solidity Contract
@@ -47,10 +47,10 @@ Modified Reth EVM
     │ Routes to API_CALL precompile
     ▼
 Native Rust Precompile
-    │ HTTP request → JSON parse → ABI encode
+    │ HTTP fetch → broadcast to peers → collect values → compute median
     ▼
 Contract receives abi.decode(out, (uint256))
-    │ Uses live data in logic
+    │ Aggregated result from multiple validators
     ▼
 Done. No oracle. No middleware. No waiting.
 ```
@@ -74,46 +74,53 @@ The foundation. One modified Reth node that executes real HTTP calls during EVM 
 - Foundry, MetaMask, and Remix compatible
 - Chain ID: `22042004`
 
-### v2 — Multi-Node Median Aggregation 🔨 In Progress
+### v2 — Multi-Node Consensus + Median Aggregation ✅
 
 The leap from "one trusted node" to "multiple validators agreeing on reality."
 
-- **Custom `extern/1` devp2p subprotocol** — nodes broadcast fetched API values to peers via RLP-encoded wire messages over RLPx
-- **Median aggregation** for `uint256` responses — sort values from all validators, take the middle. One liar can't move the median
-- **Majority vote** for `string` and `bool` responses — 2/3 agreement required
-- **Deterministic request hashing** — `keccak256(url || method || body || responsePath || responseType)` for cross-node value correlation
-- **Custom consensus layer binary** (`externevm-consensus`) — a standalone Rust binary implementing the Ethereum Engine API with JWT authentication
-- **Round-robin PoA** proposer selection with 5-second slots and missed-slot recovery
-- **3-node devnet** — each node runs Reth (EL) + `externevm-consensus` (CL), connected via p2p, producing blocks and exchanging API values independently
+**Execution Layer (Modified Reth):**
+
+- **Protocol store** — thread-safe in-memory storage (`Arc<RwLock<>>` + `LazyLock` singleton) for pending requests, validator submissions, and finalized results. 15 unit tests passing.
+- **Median aggregation** for `uint256` — sort values from all validators, take the middle. One liar can't move the median.
+- **Majority vote** for `string` and `bool` — 2/3 agreement required for finalization.
+- **Custom `extern/1` devp2p subprotocol** — nodes broadcast fetched API values to peers via RLP-encoded wire messages over RLPx. `ProtocolHandler` → `ConnectionHandler` → bidirectional `Stream` implementation.
+- **Deterministic request hashing** — `keccak256(url ‖ 0xFF ‖ method ‖ 0xFF ‖ responsePath ‖ 0xFF ‖ responseType)` for cross-node value correlation.
+
+**Consensus Layer (`externevm-consensus`):**
+
+- **Standalone Rust binary** — zero Reth dependencies, pure HTTP client using `reqwest` + `serde_json` + `jsonwebtoken`.
+- **Round-Robin PoA** proposer selection — validators take turns producing blocks every 5 seconds, following [EIP-225](https://eips.ethereum.org/EIPS/eip-225) (Clique) conceptually but implemented as a separate CL binary over the Engine API.
+- **Engine API V3** — `forkchoiceUpdatedV3`, `getPayloadV3`, `newPayloadV3` per the [Cancun spec](https://github.com/ethereum/execution-apis/blob/main/src/engine/cancun.md). JWT authentication per the [Engine API auth spec](https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md).
+- **`ConsensusStrategy` trait** — the swap point for future consensus upgrades. v2 implements `RoundRobin`. v4 will implement `StakeWeighted`. Same Engine API, same binary structure, different selection logic.
+- **3-node devnet confirmed working** — round-robin block production across 3 validators, all nodes accepting each other's blocks via Engine API.
 
 #### Architecture
 
 ```
-┌──────────────────────────────────┐
-│   externevm-consensus (CL)       │
-│   Round-Robin PoA                │
-│   ConsensusStrategy trait        │
-│   v2: RoundRobin                 │
-│   v4: StakeWeighted (future)     │
-└───────────────┬──────────────────┘
-                │ Engine API (HTTP + JWT)
-                │ forkchoiceUpdatedV3
-                │ getPayloadV3
-                │ newPayloadV3
-┌───────────────▼──────────────────┐
-│   Modified Reth (EL)             │
-│                                  │
-│   0xAA  API_CALL precompile      │
-│   extern/1  devp2p subprotocol   │
-│   Protocol store (in-memory)     │
-│                                  │
-│   Future:                        │
-│   0xA1  API_REQUEST              │
-│   0xA2  API_READ                 │
-└──────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                     ExternEVM Protocol                        │
+│                                                               │
+│  ┌───────────────────────┐  Engine API   ┌─────────────────┐ │
+│  │   Execution Layer     │◄─(EIP-3675)──►│ Consensus Layer │ │
+│  │   (Modified Reth)     │  JWT Auth     │                 │ │
+│  │                       │  Port 8551    │ externevm-      │ │
+│  │  0xAA API_CALL        │               │ consensus       │ │
+│  │  extern/1 subproto    │               │                 │ │
+│  │  Protocol store       │               │ Round-Robin PoA │ │
+│  │  Median aggregation   │               │ 5-second slots  │ │
+│  │                       │               │ Fork choice     │ │
+│  └───────────┬───────────┘               └────────┬────────┘ │
+│              │ eth/68 + extern/1                   │          │
+│              └─────────────┬───────────────────────┘          │
+│                            │                                  │
+│                    ┌───────▼────────┐                         │
+│                    │  Peer Nodes    │                         │
+│                    │  (same stack)  │                         │
+│                    └────────────────┘                         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-The EL/CL separation mirrors real Ethereum — Reth handles execution, the consensus binary handles block production. They communicate over the same Engine API that Lighthouse/Prysm use. Swapping consensus logic (round-robin → stake-weighted → BFT) means recompiling one binary. Reth stays untouched.
+The EL/CL separation follows [EIP-3675](https://eips.ethereum.org/EIPS/eip-3675) (The Merge). This mirrors the Lighthouse↔Reth / Prysm↔Geth architecture of production Ethereum — but with custom consensus logic and native external data access. Swapping consensus (round-robin → stake-weighted → BFT) means recompiling one binary. Reth stays untouched.
 
 ---
 
@@ -136,23 +143,26 @@ This struct is stable across all versions. The same contract works on v1 through
 
 ## Roadmap
 
-### v2 — Multi-Node Median Aggregation *(in progress)*
-Multiple validators fetch API data independently. Chain computes deterministic median. One malicious node can't move the result. Open submission model — sufficient for a permissioned validator set.
+### v1 — Single-Node Direct API Calls ✅
+Foundation. One Reth node, one precompile, live HTTP during execution.
+
+### v2 — Multi-Node Median Aggregation ✅
+Custom consensus layer (round-robin PoA via Engine API). Multiple validators fetch independently, broadcast via `extern/1` devp2p subprotocol, chain computes median. 3-node devnet confirmed working.
 
 ### v3 — Commit-Reveal Consensus
 Validators commit `keccak256(value || salt)` first, then reveal. Prevents frontrunning, free-riding, and last-mover advantage. No one sees anyone's answer until everyone has committed. Requires ≥2/3 honest validators.
 
 ### v4 — Stake-Weighted Finalization + Slashing
-Validators stake tokens to participate. Misbehavior (commit without reveal, hash mismatch, consecutive misses) gets slashed. Stake-weighted median gives more influence to validators with more skin in the game. Cost of attack becomes calculable.
+Validators stake tokens to participate. Misbehavior (commit without reveal, hash mismatch, consecutive misses) gets slashed. Stake-weighted median gives more influence to validators with more at risk. Cost of attack becomes calculable. `ConsensusStrategy` trait swaps from `RoundRobin` to `StakeWeighted`.
 
 ### v5 — TEE Attestation + ZK Proof of Fetch
-Hardware enclaves (SGX/Nitro) prove a validator actually made the HTTP request. TLSNotary provides software-based proof of fetch. ZK circuits prove JSON parsing was done correctly without revealing the raw response. Trust math, not people.
+Hardware enclaves (SGX/Nitro) prove a validator actually made the HTTP request and received the response they claim. TLSNotary provides software-based proof of fetch. ZK circuits prove JSON parsing was done correctly without revealing the raw response. Trust math, not people.
 
 ### Future — `solc` Modification
 Replace the verbose `staticcall` pattern with native syntax:
 
 ```solidity
-// Today (v1):
+// Today:
 (bool ok, bytes memory out) = API_CALL.staticcall(abi.encode(req));
 uint256 price = abi.decode(out, (uint256));
 
@@ -166,22 +176,18 @@ Compiler lowers `api_call(...)` into the same precompile call — ABI encode, st
 
 ## Running Locally
 
+### Single-Node (v1 mode)
+
 ```bash
-# Clone with submodules
 git clone --recursive https://github.com/ExternEVM/ExternEVM.git
 cd ExternEVM
 
-# Build modified Reth (~15-30 min first time)
 cd reth && cargo build --release
-
-# Start the node
 cargo run --release -- node \
   --dev \
   --chain ../config/genesis.json \
-  --http \
-  --http.api eth,net,web3,debug,trace \
-  --http.addr 0.0.0.0 \
-  --http.port 8545
+  --http --http.api eth,net,web3,debug,trace \
+  --http.addr 0.0.0.0 --http.port 8545
 
 # Deploy and call (new terminal)
 cd ../contracts && forge build
@@ -189,16 +195,61 @@ forge create src/ExternApiDemo.sol:ExternApiDemo \
   --rpc-url http://127.0.0.1:8545 \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
-# Get live Bitcoin price from a smart contract
 cast call $CONTRACT "getBitcoinPrice()(uint256)" --rpc-url http://127.0.0.1:8545
 ```
 
-Or with Docker:
+### Multi-Node Devnet (v2 mode)
+
+Requires 6 terminals — 3 Reth nodes (EL) + 3 consensus nodes (CL). Each node runs both binaries communicating over the Engine API with shared JWT authentication.
+
+```bash
+# Build both layers
+cd reth && cargo build --release && cd ..
+cd consensus && cargo build && cd ..
+openssl rand -hex 32 > config/jwt.hex
+
+# Start Node 1 EL
+EXTERNEVM_VALIDATOR_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+cargo run --release -- node \
+  --chain ../config/genesis.json \
+  --http --http.api eth,net,web3,debug,trace,admin \
+  --http.addr 0.0.0.0 --http.port 8545 \
+  --authrpc.port 8551 --authrpc.jwtsecret ../config/jwt.hex \
+  --port 30303 --discovery.port 30303 --discovery.v5.port 9200 \
+  --datadir /tmp/externevm-node1
+
+# Start Node 1 CL
+cargo run -- \
+  --validator 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+  --validators 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266,0x70997970C51812dc3A010C7d01b50e0d17dc79C8,0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC \
+  --el-auth-url http://127.0.0.1:8551 --el-rpc-url http://127.0.0.1:8545 \
+  --all-el-auth-urls http://127.0.0.1:8551,http://127.0.0.1:8552,http://127.0.0.1:8553 \
+  --jwt-secret ../config/jwt.hex --slot-time 5
+```
+
+Nodes 2 and 3 use different ports (`8546`/`8552`/`30304`/`9201` and `8547`/`8553`/`30305`/`9202`) and connect to Node 1 via `--trusted-peers`. See the [full devnet guide](./README.md) in the repo.
+
+### Docker
 
 ```bash
 docker compose up --build
-# Node running on port 8545
+# Single-node on port 8545
 ```
+
+---
+
+## References
+
+| Specification | How ExternEVM Uses It |
+|---------------|----------------------|
+| [EIP-3675 — The Merge](https://eips.ethereum.org/EIPS/eip-3675) | EL/CL separation — consensus binary talks to Reth via Engine API |
+| [EIP-225 — Clique PoA](https://eips.ethereum.org/EIPS/eip-225) | Round-robin proposer selection design (reimplemented over Engine API) |
+| [EIP-4399 — PREVRANDAO](https://eips.ethereum.org/EIPS/eip-4399) | Deterministic per-slot randomness in payload attributes |
+| [Engine API — Paris](https://github.com/ethereum/execution-apis/blob/main/src/engine/paris.md) | `forkchoiceUpdated`, `newPayload`, `getPayload` core methods |
+| [Engine API — Cancun](https://github.com/ethereum/execution-apis/blob/main/src/engine/cancun.md) | V3 methods with `parentBeaconBlockRoot` field |
+| [Engine API — Auth](https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md) | JWT HS256 authentication between EL and CL |
+| [Chainlink Whitepaper v2](https://research.chain.link/whitepaper-v2.pdf) | Application-layer oracle design (comparison point) |
+| [TLSNotary](https://tlsnotary.org/) | Software-based proof of TLS fetch (v5 research reference) |
 
 ---
 
@@ -214,12 +265,16 @@ ExternEVM is building the answer.
 
 ---
 
-## ⚠️ Warning
+## ⚠️ Experimental Protocol
 
-ExternEVM v1 is **single-node only**. Direct HTTP calls during EVM execution are non-deterministic and unsafe for multi-validator blockchains. This is an experimental research chain for development, demos, and prototyping. The multi-node path (v2+) replaces direct calls with validator aggregation and consensus-safe finalization.
+ExternEVM is research software. The v2 devnet uses round-robin PoA — suitable for development, demonstration, and protocol research. The roadmap progresses through commit-reveal schemes ([v3](#roadmap)), stake-weighted consensus with slashing ([v4](#roadmap)), and TEE/ZK-assisted verification ([v5](#roadmap)).
 
 ---
 
 ## License
 
 MIT
+
+---
+
+Made with 💖 by [Prateush Sharma](https://github.com/prateushsharma)
